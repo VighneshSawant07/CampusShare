@@ -9,7 +9,10 @@ from sqlalchemy import or_
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-only-change-this-before-deployment')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY')
+
+if not app.config['SECRET_KEY']:
+    raise RuntimeError("SECRET_KEY environment variable must be set.")
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///campusshare.db').replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -309,15 +312,44 @@ def decide_booking(booking_id):
     if decision not in ['approved', 'rejected']:
         abort(400)
     if decision == 'approved':
-        overlap = Booking.query.filter(Booking.resource_id == booking.resource_id, Booking.id != booking.id,
-                                       Booking.status.in_(['approved', 'checked_out']), Booking.start_at < booking.end_at,
-                                       Booking.end_at > booking.start_at).first()
+        # Lock this resource row so concurrent approvals
+        # for the same resource are processed one at a time.
+        resource = (
+            Resource.query
+            .filter_by(id=booking.resource_id)
+            .with_for_update()
+            .first()
+        )
+
+        if resource is None:
+            abort(404)
+
+        overlap = Booking.query.filter(
+            Booking.resource_id == booking.resource_id,
+            Booking.id != booking.id,
+            Booking.status.in_(['approved', 'checked_out']),
+            Booking.start_at < booking.end_at,
+            Booking.end_at > booking.start_at
+        ).first()
+
         if overlap:
             booking.status = 'waitlisted'
-            booking.decision_reason = 'Another booking was approved for an overlapping time; queued for review.'
-            record_event('booking_waitlisted', 'booking', booking.id, booking.decision_reason)
+            booking.decision_reason = (
+                'Another booking was approved for an overlapping time; '
+                'queued for review.'
+            )
+            record_event(
+                'booking_waitlisted',
+                'booking',
+                booking.id,
+                booking.decision_reason
+            )
             db.session.commit()
-            flash('Another booking overlaps this time. The request was wait-listed instead.', 'warning')
+            flash(
+                'Another booking overlaps this time. '
+                'The request was wait-listed instead.',
+                'warning'
+            )
             return redirect(url_for('owner_dashboard'))
     booking.status = decision
     booking.decision_reason = reason or ('Approved by resource owner.' if decision == 'approved' else 'Not approved by resource owner.')
